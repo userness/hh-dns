@@ -52,7 +52,8 @@ async function handleDNSQuery(request) {
       return forwardDNSQuery(dnsQuery)
     }
     
-    // Check cache first
+    // Clean up old cache entries and check cache
+    cleanupCache()
     const cacheKey = `dns:${domain}`
     const cached = dnsCache.get(cacheKey)
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
@@ -336,12 +337,12 @@ function base64UrlDecode(str) {
   }
 }
 
-// Clean up old cache entries periodically
-setInterval(() => {
+// Clean up old cache entries on access
+function cleanupCache() {
   const now = Date.now()
   for (const [key, value] of dnsCache.entries()) {
     if (now - value.timestamp > CACHE_TTL) {
       dnsCache.delete(key)
     }
   }
-}, 60000) // Clean up every minute
+}
