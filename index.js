@@ -15,6 +15,10 @@ async function handleRequest(request) {
   try {
     const url = new URL(request.url)
     
+    // Log all requests for debugging
+    console.log(`Request: ${request.method} ${url.pathname}${url.search}`)
+    console.log(`Headers:`, Object.fromEntries(request.headers))
+    
     // Handle DNS over HTTPS queries
     if (url.pathname === '/dns-query') {
       return handleDNSQuery(request)
@@ -28,27 +32,139 @@ async function handleRequest(request) {
   }
 }
 
+async function handleSimpleDNSQuery(domain, type) {
+  try {
+    console.log(`Simple DNS query: ${domain} (${type})`)
+    
+    // Check for custom domain mapping
+    for (const [extension, target] of Object.entries(domainMappings)) {
+      if (domain.endsWith(`.${extension}`)) {
+        console.log(`Custom domain match: ${domain} -> ${extension}`)
+        const baseDomain = domain.slice(0, -(extension.length + 1))
+        const targetHost = `${baseDomain}.${target}`
+        console.log(`Resolving target: ${targetHost}`)
+        
+        // Resolve target IP
+        const ip = await resolveIP(targetHost)
+        console.log(`Resolved IP for ${targetHost}:`, ip)
+        
+        if (ip) {
+          // Return JSON response for simple queries
+          return new Response(JSON.stringify({
+            Status: 0,
+            TC: false,
+            RD: true,
+            RA: true,
+            AD: false,
+            CD: false,
+            Question: [
+              {
+                name: domain,
+                type: type === 'A' ? 1 : 28
+              }
+            ],
+            Answer: [
+              {
+                name: domain,
+                type: 1,
+                TTL: 300,
+                data: ip
+              }
+            ]
+          }, null, 2), {
+            headers: {
+              'Content-Type': 'application/json',
+              'Cache-Control': 'max-age=300'
+            }
+          })
+        } else {
+          return new Response(JSON.stringify({
+            Status: 2, // SERVFAIL
+            Question: [
+              {
+                name: domain,
+                type: type === 'A' ? 1 : 28
+              }
+            ],
+            Answer: []
+          }, null, 2), {
+            headers: {
+              'Content-Type': 'application/json'
+            }
+          })
+        }
+      }
+    }
+    
+    // Forward to upstream for non-custom domains
+    console.log('No custom mapping found, forwarding to upstream')
+    const response = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=${type}`, {
+      headers: { 
+        'Accept': 'application/dns-json',
+        'User-Agent': 'CloudflareWorker/1.0'
+      }
+    })
+    
+    const data = await response.json()
+    return new Response(JSON.stringify(data, null, 2), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'max-age=300'
+      }
+    })
+    
+  } catch (error) {
+    console.error('Simple DNS query error:', error)
+    return new Response(JSON.stringify({
+      Status: 2,
+      error: error.message
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    })
+  }
+}
+
 async function handleDNSQuery(request) {
   try {
+    console.log('DNS Query received')
     const url = new URL(request.url)
     let dnsQuery
     
     if (request.method === 'GET') {
       const dnsParam = url.searchParams.get('dns')
-      if (!dnsParam) {
-        return new Response('Missing dns parameter', { status: 400 })
+      const nameParam = url.searchParams.get('name')
+      const typeParam = url.searchParams.get('type')
+      
+      console.log('GET DNS param:', dnsParam ? 'present' : 'missing')
+      console.log('GET name param:', nameParam)
+      console.log('GET type param:', typeParam)
+      
+      if (dnsParam) {
+        // Standard DoH with base64url-encoded DNS query
+        dnsQuery = base64UrlDecode(dnsParam)
+      } else if (nameParam) {
+        // Simple name/type query for testing
+        return handleSimpleDNSQuery(nameParam, typeParam || 'A')
+      } else {
+        return new Response('Missing dns parameter or name parameter', { status: 400 })
       }
-      dnsQuery = base64UrlDecode(dnsParam)
     } else if (request.method === 'POST') {
+      console.log('POST DNS query')
       const buffer = await request.arrayBuffer()
       dnsQuery = buffer
+      console.log('DNS query size:', buffer.byteLength)
     } else {
       return new Response('Method not allowed', { status: 405 })
     }
     
     const domain = parseDNSQuery(dnsQuery)
+    console.log('Parsed domain:', domain)
     
     if (!domain) {
+      console.log('No domain parsed, forwarding to upstream')
       return forwardDNSQuery(dnsQuery)
     }
     
@@ -57,6 +173,7 @@ async function handleDNSQuery(request) {
     const cacheKey = `dns:${domain}`
     const cached = dnsCache.get(cacheKey)
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+      console.log('Cache hit for:', domain)
       const dnsResponse = createDNSResponse(dnsQuery, cached.ip)
       return new Response(dnsResponse, {
         headers: {
@@ -69,27 +186,34 @@ async function handleDNSQuery(request) {
     // Check for custom domain mapping
     for (const [extension, target] of Object.entries(domainMappings)) {
       if (domain.endsWith(`.${extension}`)) {
+        console.log(`Custom domain match: ${domain} -> ${extension}`)
         const baseDomain = domain.slice(0, -(extension.length + 1))
         const targetHost = `${baseDomain}.${target}`
+        console.log(`Resolving target: ${targetHost}`)
         
         // Resolve target and create DNS response
         const ip = await resolveIP(targetHost)
+        console.log(`Resolved IP for ${targetHost}:`, ip)
         if (ip) {
           // Cache the result
           dnsCache.set(cacheKey, { ip, timestamp: Date.now() })
           
           const dnsResponse = createDNSResponse(dnsQuery, ip)
+          console.log(`Returning custom DNS response for ${domain} -> ${ip}`)
           return new Response(dnsResponse, {
             headers: {
               'Content-Type': 'application/dns-message',
               'Cache-Control': 'max-age=300'
             }
           })
+        } else {
+          console.log(`Failed to resolve ${targetHost}`)
         }
       }
     }
     
     // Forward to upstream DNS
+    console.log('No custom mapping found, forwarding to upstream')
     return forwardDNSQuery(dnsQuery)
     
   } catch (error) {
@@ -103,11 +227,15 @@ async function handleProxy(request) {
     const url = new URL(request.url)
     const hostname = url.hostname
     
+    console.log(`Proxy request for: ${hostname}`)
+    
     // Check if domain matches any of our patterns
     for (const [extension, target] of Object.entries(domainMappings)) {
       if (hostname.endsWith(`.${extension}`)) {
+        console.log(`Proxy domain match: ${hostname} -> ${extension}`)
         const baseDomain = hostname.slice(0, -(extension.length + 1))
         const targetHost = `${baseDomain}.${target}`
+        console.log(`Proxying to: ${targetHost}`)
         
         const targetUrl = new URL(request.url)
         targetUrl.hostname = targetHost
@@ -124,6 +252,7 @@ async function handleProxy(request) {
         newRequest.headers.set('Host', targetHost)
         
         const response = await fetch(newRequest)
+        console.log(`Proxy response status: ${response.status}`)
         
         // Clone response and modify headers
         const newResponse = new Response(response.body, {
@@ -148,6 +277,7 @@ async function handleProxy(request) {
       }
     }
     
+    console.log(`No proxy mapping found for: ${hostname}`)
     // Forward request as-is if no mapping found
     return fetch(request)
   } catch (error) {
