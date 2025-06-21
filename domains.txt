@@ -1,0 +1,2 @@
+.hh -> -hh.netlify.app
+.pg -> -hh.pages.dev
